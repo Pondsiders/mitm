@@ -85,44 +85,92 @@ class ScribeLogger:
         except Exception as e:
             print(f"[scribe] Insert failed: {e}")
 
-    def _strip_system_reminders(self, text: str) -> str:
-        """Strip <system-reminder> blocks using boundary detection.
+    def _is_system_noise(self, text: str) -> bool:
+        """Check if message is system noise that should be filtered out.
 
-        Algorithm:
-        1. Find span from first <system-reminder> to last </system-reminder>
-        2. Keep everything before and after that span
-        3. Clean any straggler blocks from the residue
+        Blacklist approach: filter known noise patterns, keep everything else.
         """
-        # Find first opening tag
-        first_open = text.find('<system-reminder>')
-        if first_open == -1:
-            return text  # No system reminders, return as-is
+        # Exact matches (after stripping)
+        noise_exact = {
+            "Stop hook feedback:",
+        }
+        if text in noise_exact:
+            return True
 
-        # Find last closing tag
-        last_close = text.rfind('</system-reminder>')
-        if last_close == -1:
-            return text  # Malformed, return as-is (safe failure)
+        # Prefix matches
+        noise_prefixes = (
+            "Command: ",           # Tool invocation logs
+            "<policy_spec>",       # Bash risk assessment
+            "<is_displaying_contents>",  # Claude Code internal state
+        )
+        if text.startswith(noise_prefixes):
+            return True
 
-        # The span to remove is from first_open to end of last closing tag
-        end_of_last_close = last_close + len('</system-reminder>')
+        # Very short messages that look like command echoes (e.g., "psql", "git")
+        # Real conversation is rarely < 10 chars
+        if len(text) < 10 and not any(c in text for c in '?!.'):
+            return True
 
-        # Keep everything before first_open and after end_of_last_close
-        before = text[:first_open].strip()
-        after = text[end_of_last_close:].strip()
+        return False
 
-        # Second pass: clean any straggler system-reminder blocks from after
-        after = re.sub(r'<system-reminder>.*?</system-reminder>', '', after, flags=re.DOTALL)
-        after = re.sub(r'\n{3,}', '\n\n', after).strip()
+    # XML-style tags to strip from messages
+    NOISE_TAGS = [
+        'system-reminder',
+        'ide_opened_file',
+        'ide_selection',
+        'command-name',
+        'command-message',
+        'command-args',
+        'local-command-stdout',
+    ]
 
-        # Combine what's left
-        if before and after:
-            return f"{before}\n\n{after}"
-        return before or after or ""
+    def _strip_noise_tags(self, text: str) -> str:
+        """Strip XML-style noise blocks using boundary detection.
+
+        For each tag type, finds the span from first open to last close
+        and removes everything in between, keeping content before and after.
+        """
+        result = text
+
+        for tag in self.NOISE_TAGS:
+            open_tag = f'<{tag}>'
+            close_tag = f'</{tag}>'
+
+            # Find first opening tag
+            first_open = result.find(open_tag)
+            if first_open == -1:
+                continue  # This tag not present
+
+            # Find last closing tag
+            last_close = result.rfind(close_tag)
+            if last_close == -1:
+                continue  # Malformed, skip (safe failure)
+
+            # The span to remove is from first_open to end of last closing tag
+            end_of_last_close = last_close + len(close_tag)
+
+            # Keep everything before first_open and after end_of_last_close
+            before = result[:first_open].strip()
+            after = result[end_of_last_close:].strip()
+
+            # Second pass: clean any straggler blocks of this tag type
+            after = re.sub(rf'<{tag}>.*?</{tag}>', '', after, flags=re.DOTALL)
+
+            # Combine what's left
+            if before and after:
+                result = f"{before}\n\n{after}"
+            else:
+                result = before or after or ""
+
+        # Clean up excessive newlines
+        result = re.sub(r'\n{3,}', '\n\n', result).strip()
+
+        return result
 
     def _extract_text_from_content(self, content) -> str:
-        """Extract text from content blocks and strip system reminders."""
+        """Extract text from content blocks and strip noise tags."""
         if isinstance(content, str):
-            return self._strip_system_reminders(content)
+            return self._strip_noise_tags(content)
         if isinstance(content, list):
             texts = []
             for block in content:
@@ -135,7 +183,7 @@ class ScribeLogger:
                 elif isinstance(block, str):
                     texts.append(block)
             raw_text = "".join(texts)
-            return self._strip_system_reminders(raw_text)
+            return self._strip_noise_tags(raw_text)
         return ""
 
     def _parse_sse_response(self, body: bytes) -> str:
@@ -212,7 +260,7 @@ class ScribeLogger:
                             continue  # Skip this message, look for earlier one with text
 
                     content = self._extract_text_from_content(msg_content)
-                    if content.strip():
+                    if content.strip() and not self._is_system_noise(content.strip()):
                         self._insert_message(conv_id, "human", content.strip())
                         break  # Found a real user message
 
@@ -245,7 +293,7 @@ class ScribeLogger:
                 content = self._extract_text_from_content(body.get("content", []))
                 msg_uuid = body.get("id")
 
-            if content.strip():
+            if content.strip() and not self._is_system_noise(content.strip()):
                 self._insert_message(conv_id, "assistant", content.strip(), msg_uuid)
 
         except Exception as e:

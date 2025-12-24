@@ -13,6 +13,7 @@ services:
     environment:
       - MITM_DATA_DIR=/data
       - SCRIBE_DB_URL=postgresql://scribe:scribe@172.17.0.1:5725/scribe
+      - REDIS_URL=redis://172.17.0.1:6379
     command: >
       mitmdump
       --mode reverse:https://api.anthropic.com

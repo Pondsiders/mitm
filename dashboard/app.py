@@ -1,13 +1,14 @@
 """
 Alpha Usage Dashboard - Streamlit app for monitoring Claude API usage.
 
-The model: 84 driving hours per week (6 AM - 6 PM Pacific, 7 days).
-Week starts Monday 11 AM Pacific. Each day has a cumulative target.
+The model: Use the reset timestamp from the API as ground truth.
+Count driving hours (6 AM - 6 PM Pacific) between now and reset.
+Compare actual burn rate to sustainable rate.
 """
 
 import pandas as pd
 import streamlit as st
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -15,99 +16,52 @@ from pathlib import Path
 CSV_PATH = Path("/data/quota.csv")
 REFRESH_SECONDS = 30
 PACIFIC = ZoneInfo("America/Los_Angeles")
+UTC = ZoneInfo("UTC")
 
-# Driving hours: 6 AM to 6 PM = 12 hours per day
-# But Monday starts at 11 AM, so Monday = 7 hours
-# Week: Mon(7) + Tue-Sun(12*6=72) + Mon morning 6-10:59(5) = 84 hours
-# Cumulative targets at END of each day (6 PM Pacific):
-#   Monday EOD:    7 hrs  ->  7/84  =  8.33%
-#   Tuesday EOD:  19 hrs  -> 19/84  = 22.62%
-#   Wednesday EOD: 31 hrs -> 31/84  = 36.90%
-#   Thursday EOD:  43 hrs -> 43/84  = 51.19%
-#   Friday EOD:    55 hrs -> 55/84  = 65.48%
-#   Saturday EOD:  67 hrs -> 67/84  = 79.76%
-#   Sunday EOD:    79 hrs -> 79/84  = 94.05%
-#   Monday 10:59:  84 hrs -> 84/84  = 100%
-
-CUMULATIVE_HOURS = {
-    0: 7,   # Monday EOD (11 AM - 6 PM = 7 hrs)
-    1: 19,  # Tuesday EOD
-    2: 31,  # Wednesday EOD
-    3: 43,  # Thursday EOD
-    4: 55,  # Friday EOD
-    5: 67,  # Saturday EOD
-    6: 79,  # Sunday EOD
-}
-TOTAL_DRIVING_HOURS = 84
+# Driving hours: 6 AM to 6 PM Pacific
+DRIVING_START_HOUR = 6
+DRIVING_END_HOUR = 18
 
 
-def get_week_start(now_pacific: datetime) -> datetime:
-    """Get the Monday 11 AM Pacific that starts this week's window."""
-    # Find most recent Monday
-    days_since_monday = now_pacific.weekday()  # Monday = 0
-    monday = now_pacific - timedelta(days=days_since_monday)
-    monday_11am = monday.replace(hour=11, minute=0, second=0, microsecond=0)
+def count_driving_hours(start: datetime, end: datetime) -> float:
+    """Count 6am-6pm Pacific hours between two timestamps."""
+    # Convert to Pacific for driving window calculations
+    start_pacific = start.astimezone(PACIFIC)
+    end_pacific = end.astimezone(PACIFIC)
 
-    # If we're before Monday 11 AM, go back a week
-    if now_pacific < monday_11am:
-        monday_11am -= timedelta(days=7)
-
-    return monday_11am
-
-
-def get_driving_hours_elapsed(now_pacific: datetime, week_start: datetime) -> float:
-    """Calculate driving hours elapsed since week start."""
     hours = 0.0
-    current = week_start
+    current = start_pacific
 
-    while current < now_pacific:
-        current_day = current.weekday()
-        day_start = current.replace(hour=6, minute=0, second=0, microsecond=0)
-        day_end = current.replace(hour=18, minute=0, second=0, microsecond=0)
+    while current < end_pacific:
+        day_6am = current.replace(hour=DRIVING_START_HOUR, minute=0, second=0, microsecond=0)
+        day_6pm = current.replace(hour=DRIVING_END_HOUR, minute=0, second=0, microsecond=0)
 
-        # Special case: Monday starts at 11 AM, not 6 AM
-        if current_day == 0 and current.date() == week_start.date():
-            day_start = current.replace(hour=11, minute=0, second=0, microsecond=0)
+        # If we're past today's driving window, skip to tomorrow 6am
+        if current >= day_6pm:
+            next_day = current + timedelta(days=1)
+            current = next_day.replace(hour=DRIVING_START_HOUR, minute=0, second=0, microsecond=0)
+            continue
 
-        # Calculate driving hours for this day
-        if now_pacific.date() == current.date():
-            # Today - partial day
-            if now_pacific < day_start:
-                pass  # Before driving hours
-            elif now_pacific > day_end:
-                hours += (day_end - max(day_start, current)).total_seconds() / 3600
-            else:
-                hours += (now_pacific - max(day_start, current)).total_seconds() / 3600
-            break
-        else:
-            # Full day (within driving window)
-            if current <= day_end:
-                hours += (day_end - max(day_start, current)).total_seconds() / 3600
-            current = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0)
+        # If we're before today's driving window, fast forward to 6am
+        if current < day_6am:
+            current = day_6am
 
-    return max(0, hours)
+        # Now we're in the driving window - count hours until 6pm or end, whichever first
+        window_end = min(end_pacific, day_6pm)
+        if window_end > current:
+            hours += (window_end - current).total_seconds() / 3600
+
+        # Move to next day 6am
+        next_day = current + timedelta(days=1)
+        current = next_day.replace(hour=DRIVING_START_HOUR, minute=0, second=0, microsecond=0)
+
+    return hours
 
 
-def get_target_now(now_pacific: datetime, week_start: datetime) -> float:
-    """Get the target utilization for right now (based on driving hours elapsed)."""
-    hours = get_driving_hours_elapsed(now_pacific, week_start)
-    return hours / TOTAL_DRIVING_HOURS
-
-
-def get_target_eod(now_pacific: datetime) -> float:
-    """Get target utilization at 6 PM today."""
-    weekday = now_pacific.weekday()
-    return CUMULATIVE_HOURS.get(weekday, 79) / TOTAL_DRIVING_HOURS
-
-
-def get_hours_until_6pm(now_pacific: datetime) -> float:
+def get_driving_hours_until_6pm(now_pacific: datetime) -> float:
     """Get driving hours remaining until 6 PM today."""
-    six_pm = now_pacific.replace(hour=18, minute=0, second=0, microsecond=0)
-    six_am = now_pacific.replace(hour=6, minute=0, second=0, microsecond=0)
-
-    # Special case: Monday, driving starts at 11 AM
-    if now_pacific.weekday() == 0:
-        six_am = now_pacific.replace(hour=11, minute=0, second=0, microsecond=0)
+    six_pm = now_pacific.replace(hour=DRIVING_END_HOUR, minute=0, second=0, microsecond=0)
+    six_am = now_pacific.replace(hour=DRIVING_START_HOUR, minute=0, second=0, microsecond=0)
 
     if now_pacific >= six_pm:
         return 0.0
@@ -117,51 +71,37 @@ def get_hours_until_6pm(now_pacific: datetime) -> float:
         return (six_pm - now_pacific).total_seconds() / 3600
 
 
-def calculate_projection(current_util: float, target_eod: float, hours_left: float,
-                         start_of_day_util: float, hours_driven_today: float) -> dict:
-    """Calculate when we'll hit today's target."""
-    remaining_budget = target_eod - current_util
-    used_today = current_util - start_of_day_util
+def get_burn_rate(df: pd.DataFrame, lookback_hours: float = 2.0) -> tuple[float, float]:
+    """Calculate burn rate from recent data.
 
-    if hours_driven_today <= 0:
-        # No data for today yet
-        return {
-            'status': 'no_data',
-            'message': "No driving data today yet",
-        }
+    Returns (rate_per_hour, driving_hours_in_window).
+    Rate is in percentage points per driving hour.
+    """
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(hours=lookback_hours)
 
-    burn_rate = used_today / hours_driven_today  # % per hour
+    recent = df[df['timestamp'] >= cutoff]
+    if len(recent) < 2:
+        return 0.0, 0.0
 
-    if burn_rate <= 0:
-        return {
-            'status': 'banking',
-            'message': f"Banking time — {remaining_budget*100:.1f}% headroom",
-            'remaining': remaining_budget,
-        }
+    first = recent.iloc[0]
+    last = recent.iloc[-1]
 
-    hours_to_exhaust = remaining_budget / burn_rate
+    usage_delta = last['anthropic-ratelimit-unified-7d-utilization'] - first['anthropic-ratelimit-unified-7d-utilization']
+    time_delta_hours = (last['timestamp'] - first['timestamp']).total_seconds() / 3600
 
-    if hours_to_exhaust >= hours_left:
-        # On track
-        projected_eod = current_util + (burn_rate * hours_left)
-        headroom = target_eod - projected_eod
-        return {
-            'status': 'on_track',
-            'message': f"On track — {headroom*100:.1f}% headroom at 6 PM",
-            'remaining': remaining_budget,
-            'projected_eod': projected_eod,
-        }
-    else:
-        # Will exhaust before 6 PM
-        from datetime import datetime as dt
-        now = datetime.now(PACIFIC)
-        exhaust_time = now + timedelta(hours=hours_to_exhaust)
-        return {
-            'status': 'exhausted',
-            'message': f"Budget exhausted at {exhaust_time.strftime('%-I:%M %p')}",
-            'exhaust_time': exhaust_time,
-            'remaining': remaining_budget,
-        }
+    if time_delta_hours <= 0:
+        return 0.0, 0.0
+
+    # Calculate driving hours in this window
+    driving_hours = count_driving_hours(first['timestamp'].to_pydatetime(), last['timestamp'].to_pydatetime())
+
+    if driving_hours <= 0:
+        # All activity was outside driving hours (overnight)
+        return 0.0, 0.0
+
+    rate = usage_delta / driving_hours
+    return rate, driving_hours
 
 
 # === Streamlit App ===
@@ -196,78 +136,127 @@ if df is None or len(df) == 0:
 latest = df.iloc[-1]
 util_7d = latest['anthropic-ratelimit-unified-7d-utilization']
 util_5h = latest['anthropic-ratelimit-unified-5h-utilization']
+reset_timestamp = int(latest['anthropic-ratelimit-unified-7d-reset'])
+reset_dt = datetime.fromtimestamp(reset_timestamp, tz=UTC)
 
-# Current time in Pacific
-now = datetime.now(PACIFIC)
-week_start = get_week_start(now)
+# Current time
+now = datetime.now(UTC)
+now_pacific = now.astimezone(PACIFIC)
 
-# Calculate targets
-target_now = get_target_now(now, week_start)
-target_eod = get_target_eod(now)
-hours_left = get_hours_until_6pm(now)
+# Core calculations
+budget_remaining = 1.0 - util_7d  # As decimal (e.g., 0.97 = 97% remaining)
+driving_hours_remaining = count_driving_hours(now, reset_dt)
+hours_until_6pm = get_driving_hours_until_6pm(now_pacific)
 
-# Get start-of-day utilization (find first record after 6 AM today)
-today_6am = now.replace(hour=6, minute=0, second=0, microsecond=0)
-if now.weekday() == 0:  # Monday
-    today_6am = now.replace(hour=11, minute=0, second=0, microsecond=0)
+# Actual burn rate from recent data
+actual_rate, rate_window_hours = get_burn_rate(df, lookback_hours=3.0)
 
-today_data = df[df['timestamp'] >= today_6am.astimezone(ZoneInfo('UTC'))]
-if len(today_data) > 0:
-    start_of_day_util = today_data.iloc[0]['anthropic-ratelimit-unified-7d-utilization']
-    hours_driven_today = get_driving_hours_elapsed(now, week_start) - get_driving_hours_elapsed(
-        today_6am, week_start)
+# Project usage at reset based on current rate
+if rate_window_hours >= 0.5 and actual_rate > 0 and driving_hours_remaining > 0:
+    projected_at_reset = util_7d + (actual_rate * driving_hours_remaining)
 else:
-    start_of_day_util = util_7d  # Fallback
-    hours_driven_today = 0
+    projected_at_reset = None  # Not enough data to project
 
-# Position: ahead or behind?
-position = target_now - util_7d  # Positive = ahead, negative = behind
+# Verdict based on projection
+# 100% = THE WALL. Over = bad. Under = safety margin.
+if projected_at_reset is None:
+    pace_status = "no_data"
+    pace_message = "Not enough data to project"
+elif projected_at_reset > 1.0:
+    # Will hit the wall
+    pace_status = "wall"
+    # Calculate when we'll hit 100%
+    remaining_to_wall = 1.0 - util_7d
+    hours_to_wall = remaining_to_wall / actual_rate if actual_rate > 0 else 0
+    pace_message = f"Will hit wall in ~{hours_to_wall:.0f} driving hours"
+elif projected_at_reset > 0.95:
+    pace_status = "tight"
+    margin = (1.0 - projected_at_reset) * 100
+    pace_message = f"Tight — only {margin:.1f}% margin"
+elif projected_at_reset > 0.80:
+    pace_status = "comfortable"
+    margin = (1.0 - projected_at_reset) * 100
+    pace_message = f"Comfortable — {margin:.0f}% margin"
+else:
+    pace_status = "runway"
+    margin = (1.0 - projected_at_reset) * 100
+    pace_message = f"Plenty of runway — {margin:.0f}% margin"
 
 # === Display ===
 
-# Main status
-st.subheader("Today's Budget")
+st.subheader("Budget Status")
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
     st.metric(
-        label="Current",
-        value=f"{util_7d * 100:.2f}%",
+        label="Used",
+        value=f"{util_7d * 100:.1f}%",
     )
 
 with col2:
     st.metric(
-        label="Target (now)",
-        value=f"{target_now * 100:.2f}%",
+        label="Remaining",
+        value=f"{budget_remaining * 100:.1f}%",
     )
 
 with col3:
-    delta_str = f"{position * 100:+.2f}%"
-    if position >= 0:
-        st.metric(label="Position", value="Ahead", delta=delta_str)
-    else:
-        st.metric(label="Position", value="Behind", delta=delta_str, delta_color="inverse")
+    st.metric(
+        label="Driving Hours Left",
+        value=f"{driving_hours_remaining:.1f}h",
+    )
 
 # Projection
 st.divider()
-projection = calculate_projection(util_7d, target_eod, hours_left, start_of_day_util, hours_driven_today)
+st.subheader("Projection")
 
-if projection['status'] == 'on_track':
-    st.success(f"✅ {projection['message']}")
-elif projection['status'] == 'banking':
-    st.success(f"💰 {projection['message']}")
-elif projection['status'] == 'exhausted':
-    st.error(f"⚠️ {projection['message']}")
+if projected_at_reset is not None:
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label="Projected at Reset",
+            value=f"{projected_at_reset * 100:.1f}%",
+        )
+    with col2:
+        st.metric(
+            label="The Wall",
+            value="100%",
+        )
+
+# Status indicator
+if pace_status == "wall":
+    st.error(f"🔴 {pace_message}")
+elif pace_status == "tight":
+    st.warning(f"🟡 {pace_message}")
+elif pace_status == "comfortable":
+    st.success(f"🟢 {pace_message}")
+elif pace_status == "runway":
+    st.success(f"💨 {pace_message}")
 else:
-    st.info(f"ℹ️ {projection['message']}")
+    st.info(f"ℹ️ {pace_message}")
 
-# Hours remaining
-st.caption(f"Driving hours until 6 PM: {hours_left:.1f}")
+# Rate details (smaller, for nerds)
+if actual_rate > 0:
+    st.caption(f"Current burn rate: {actual_rate * 100:.2f}%/driving hour")
+
+# Today's info
+st.divider()
+st.subheader("Today")
+
+col1, col2 = st.columns(2)
+with col1:
+    st.metric(label="Driving hours until 6 PM", value=f"{hours_until_6pm:.1f}h")
+with col2:
+    if hours_until_6pm == 0:
+        st.info("🌙 Outside driving hours")
+    elif actual_rate > 0:
+        projected_by_6pm = util_7d + (actual_rate * hours_until_6pm)
+        st.metric(label="Projected by 6 PM", value=f"{projected_by_6pm * 100:.1f}%")
 
 # 5-hour burst protection
 st.divider()
-st.subheader("Burst Protection")
+st.subheader("Burst Protection (5h)")
+
 col1, col2 = st.columns(2)
 
 with col1:
@@ -295,7 +284,8 @@ st.line_chart(chart_df, height=200)
 
 # Footer
 st.divider()
-st.caption(f"Week started: {week_start.strftime('%a %b %d, %-I:%M %p')} Pacific")
+reset_pacific = reset_dt.astimezone(PACIFIC)
+st.caption(f"Window resets: {reset_pacific.strftime('%a %b %d, %-I:%M %p')} Pacific")
 st.caption(f"Last updated: {latest['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} UTC")
 st.caption(f"Data points: {len(df)}")
 
