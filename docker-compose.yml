@@ -14,6 +14,10 @@ services:
       - MITM_DATA_DIR=/data
       - SCRIBE_DB_URL=postgresql://scribe:scribe@172.17.0.1:5725/scribe
       - REDIS_URL=redis://172.17.0.1:6379
+      # Langfuse for LLM observability (self-hosted on Primer)
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_BASE_URL=http://primer:3000
     command: >
       mitmdump
       --mode reverse:https://api.anthropic.com
@@ -22,6 +26,7 @@ services:
       --listen-port 8080
       --scripts /addons/quota_logger.py
       --scripts /addons/scribe_logger.py
+      --scripts /addons/langfuse_logger.py
 
   dashboard:
     image: python:3.12-slim
