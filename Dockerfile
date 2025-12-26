@@ -6,4 +6,5 @@ FROM mitmproxy/mitmproxy:12.1.2
 RUN pip install --no-cache-dir \
     psycopg[binary] \
     redis \
-    langfuse
+    langfuse \
+    streamlit-autorefresh
